@@ -1,62 +1,6 @@
-# Bài thực hành 03 – LLM Skill Planning với Gripper và Camera
+# Bài 03
 
-Hệ thống robot UR3e mô phỏng sử dụng:
-
-* ROS 2 Humble
-* Ubuntu 22.04
-* Gazebo Classic
-* MoveIt 2
-* UR3e
-* Gripper
-* Camera overhead
-* LLM Planner
-* 9Router
-* IFRA LinkAttacher
-
-## 1. Kiến trúc hệ thống
-
-```text
-Natural Language Command
-          |
-          v
-      LLM Planner
-          |
-          v
-    Structured Plan
-          |
-          v
-     Plan Validator
-          |
-          v
-     Skill Executor
-       /       \
-      /         \
- Camera        Robot Skills
-   |               |
-   v               v
-Perception       MoveIt 2
-                   |
-                   v
-             UR3e + Gripper
-                   |
-                   v
-                Gazebo
-```
-
-LLM chỉ có nhiệm vụ:
-
-1. Hiểu câu lệnh người dùng.
-2. Chọn skill.
-3. Xác định tham số.
-4. Sắp xếp thứ tự skill.
-
-LLM **không điều khiển trực tiếp joint** và không sinh joint trajectory.
-
----
-
-# 2. Yêu cầu hệ thống
-
-Máy mới cần:
+## 1. Yêu cầu
 
 * Ubuntu 22.04
 * ROS 2 Humble
@@ -64,94 +8,56 @@ Máy mới cần:
 * MoveIt 2
 * Git
 * Python 3
-* Node.js >= 18 nếu cần sử dụng các thành phần 9Router/LLM tương ứng.
+* Node.js >= 18
+* 9Router
 
-Kiểm tra ROS:
-
-```bash
-source /opt/ros/humble/setup.bash
-
-ros2 --version
-gazebo --version
-```
-
----
-
-# 3. Tạo workspace
+## 2. Clone project
 
 ```bash
 mkdir -p ~/ws3/src
 cd ~/ws3/src
-```
 
-Clone repository chính:
+git clone https://github.com/23020736-glitch/bai3.git ur3_llm_gripper
 
-```bash
-git clone https://github.com/23020736-glitch/ur3-llm-gripper-bai03.git ur3_llm_gripper
-```
-
-Repository cần thiết cho UR3:
-
-```bash
-git clone -b humble https://github.com/UniversalRobots/Universal_Robots_ROS2_Gazebo_Simulation.git
-```
-
-Đổi tên/thư mục nếu cần để đúng cấu trúc:
-
-```text
-~/ws3/src/
-├── ur3_llm_gripper/
-├── Universal_Robots_ROS2_Gazebo_Simulation/
-└── IFRA_LinkAttacher/
-```
-
----
-
-# 4. IFRA LinkAttacher
-
-Project sử dụng IFRA LinkAttacher để mô phỏng việc gripper giữ block trong Gazebo.
-
-Clone:
-
-```bash
-cd ~/ws3/src
+git clone -b humble \
+https://github.com/UniversalRobots/Universal_Robots_ROS2_Gazebo_Simulation.git
 
 git clone https://github.com/IFRA-Cranfield/IFRA_LinkAttacher.git
 ```
 
-Nếu repository đã được đưa vào project dưới dạng submodule, có thể dùng:
+## 3. Cài package
 
 ```bash
-cd ~/ws3
-git submodule update --init --recursive
+sudo apt update
+
+sudo apt install -y \
+git \
+python3-pip \
+python3-colcon-common-extensions \
+python3-rosdep \
+ros-humble-moveit \
+ros-humble-gazebo-ros-pkgs \
+ros-humble-gazebo-ros2-control \
+ros-humble-xacro
 ```
 
----
-
-# 5. Cài dependency
-
-Quay về workspace:
+## 4. Cài dependency
 
 ```bash
 cd ~/ws3
 
 source /opt/ros/humble/setup.bash
 
+sudo rosdep init 2>/dev/null || true
 rosdep update
 
 rosdep install \
-  --from-paths src \
-  --ignore-src \
-  -r -y
+--from-paths src \
+--ignore-src \
+-r -y
 ```
 
-Nếu một package đã được cài sẵn thì rosdep có thể báo package đó đã được đáp ứng.
-
----
-
-# 6. Build
-
-Build toàn bộ workspace:
+## 5. Build
 
 ```bash
 cd ~/ws3
@@ -159,33 +65,21 @@ cd ~/ws3
 source /opt/ros/humble/setup.bash
 
 colcon build --symlink-install
-```
 
-Sau khi build:
-
-```bash
 source ~/ws3/install/setup.bash
 ```
 
-Kiểm tra package:
+Kiểm tra:
 
 ```bash
 ros2 pkg list | grep ur3_llm_gripper
 ```
 
-Kết quả cần có:
+## 6. 9Router
 
-```text
-ur3_llm_gripper
-```
+Khởi động 9Router trước.
 
----
-
-# 7. Cấu hình LLM / 9Router
-
-Project sử dụng LLM thông qua 9Router.
-
-Base URL:
+API:
 
 ```text
 http://localhost:20128/v1
@@ -197,10 +91,113 @@ Dashboard:
 http://localhost:20128/dashboard
 ```
 
-Model sử dụng trong project:
+Model:
 
 ```text
 oc/muse-spark-1.3-contributor-free
 ```
 
-Đảm bảo 9Router đang chạy trước khi chạy LLM Plan
+Kiểm tra:
+
+```bash
+curl http://localhost:20128/v1/models
+```
+
+## 7. Chạy Bài 03
+
+### Terminal 1
+
+```bash
+cd ~/ws3
+
+source /opt/ros/humble/setup.bash
+source ~/ws3/install/setup.bash
+
+ros2 launch ur3_llm_gripper llm_gripper.launch.py scenario:=blocked
+```
+
+Chờ Gazebo + RViz chạy xong.
+
+### Terminal 2
+
+```bash
+cd ~/ws3
+
+source /opt/ros/humble/setup.bash
+source ~/ws3/install/setup.bash
+
+export PYTHONUNBUFFERED=1
+
+ros2 run ur3_llm_gripper llm_planner
+```
+
+Nhập:
+
+```text
+Put the red cube in Zone B.
+```
+
+## 8. Kiểm tra camera
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ws3/install/setup.bash
+
+ros2 topic list | grep -E "overhead|image"
+```
+
+```bash
+ros2 topic info /overhead/cam/image_raw
+```
+
+## 9. Kiểm tra perception
+
+```bash
+ros2 service call /detect_objects std_srvs/srv/Trigger "{}"
+```
+
+## 10. Kiểm tra LinkAttacher
+
+```bash
+ros2 service list | grep ATTACHLINK
+```
+
+Cần có:
+
+```text
+/ATTACHLINK
+/DETACHLINK
+```
+
+## 11. Nếu sửa code
+
+```bash
+cd ~/ws3
+
+source /opt/ros/humble/setup.bash
+
+colcon build --symlink-install \
+--packages-select ur3_llm_gripper
+
+source ~/ws3/install/setup.bash
+```
+
+## 12. Nếu Gazebo bị treo
+
+```bash
+pkill -9 gzserver 2>/dev/null || true
+pkill -9 gzclient 2>/dev/null || true
+pkill -9 rviz2 2>/dev/null || true
+pkill -9 move_group 2>/dev/null || true
+```
+
+Chạy lại:
+
+```bash
+cd ~/ws3
+
+source /opt/ros/humble/setup.bash
+source ~/ws3/install/setup.bash
+
+ros2 launch ur3_llm_gripper llm_gripper.launch.py scenario:=blocked
+```
