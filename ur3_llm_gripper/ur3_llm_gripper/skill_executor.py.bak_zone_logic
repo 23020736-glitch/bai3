@@ -1,0 +1,145 @@
+"""Skill Executor: chay plan tuan tu; camera quyet dinh hanh dong phu (don vat can tro) luc thuc thi."""
+import json
+import threading
+
+import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from std_msgs.msg import String
+
+from ur3_llm_gripper.robot_skills import SUCCESS, RobotSkills
+from ur3_llm_gripper.task_validator import (blocker_steps, insert_checks, load_config, skip_task,
+                                            validate_plan)
+
+MAX_AUTO = 6   # gioi han so lan camera chen hanh dong phu (tranh vong lap)
+
+
+def summary(state):
+    parts = [f"{n}@{o['location']}" for n, o in sorted(state["objects"].items())]
+    parts += [f"{n}@not-visible" for n in state.get("missing", [])]
+    return ", ".join(parts)
+
+
+class SkillExecutor(Node):
+    def __init__(self):
+        super().__init__("skill_executor")
+        scene, _ = load_config()
+        self.objects = [f"{c}_cube" for c in scene["colors"]]
+        self.zones = list(scene["zones"]) + list(scene["temp_positions"])
+        self.zones_main = list(scene["zones"])
+        cbg = ReentrantCallbackGroup()
+        self.skills = RobotSkills(self, scene, cbg)
+        self.busy = False
+        self.log_pub = self.create_publisher(String, "execution_log", 10)
+        self.create_subscription(String, "llm_plan", self.on_plan, 10, callback_group=cbg)
+
+    def out(self, *args):
+        text = " ".join(str(x) for x in args)
+        print(text, flush=True)
+        self.log_pub.publish(String(data=text))
+
+    def on_plan(self, msg):
+        if self.busy:
+            self.out("Robot dang ban, bo qua ke hoach moi.")
+            return
+        self.busy = True
+        threading.Thread(target=self.run, args=(msg.data,), daemon=True).start()
+
+    def call(self, s):
+        sk, a = self.skills, s
+        name = s["skill"]
+        if name == "home":
+            return sk.home()
+        if name == "detect_objects":
+            return sk.detect_objects()
+        if name == "check_zone":
+            return sk.check_zone(a["zone"])
+        if name == "pick":
+            return sk.pick(a["object"])
+        if name == "place":
+            return sk.place(a["object"], a["zone"])
+        if name == "move_to_temporary":
+            return sk.move_to_temporary(a["object"])
+        return "FAILED"
+
+    def run(self, raw):
+        try:
+            data = json.loads(raw)
+
+            # =========================================================
+            # PLAN VALIDATION CO XET TRANG THAI THUC TE CUA ROBOT
+            # =========================================================
+            errors = validate_plan(data, self.objects, self.zones)
+
+            # Validator cua Bai 02 mac dinh moi plan bat dau voi
+            # holding=None. Bai 03 cho phep tiep tuc mot task qua
+            # nhieu plan, vi du:
+            #
+            #   plan 1: pick(blue_cube)
+            #   plan 2: place(blue_cube, zone_b)
+            #
+            # Neu robot dang cam blue_cube thi "place blue_cube but
+            # holding None" khong phai loi thuc te.
+            if errors and self.skills.held:
+                held = self.skills.held
+                filtered = []
+
+                for e in errors:
+                    text = str(e).lower()
+                    valid_runtime_place = (
+                        "place" in text
+                        and held.lower() in text
+                        and "holding none" in text
+                    )
+
+                    if not valid_runtime_place:
+                        filtered.append(e)
+
+                errors = filtered
+
+            if errors:
+                self.out("EXECUTOR REJECTED PLAN:", errors)
+                return
+
+            queue = insert_checks(data["plan"], self.zones_main)
+            self.out("\nEXECUTION:")
+            n_auto = 0
+            while queue:
+                s = queue.pop(0)
+                args = [s[k] for k in ("object", "zone") if k in s]
+                label = f"{s['skill']}({', '.join(args)})" + (" [auto]" if s.get("auto") else "")
+                status = self.call(s)
+                note = ""
+                if s["skill"] in ("detect_objects", "check_zone", "pick", "move_to_temporary") and status == SUCCESS:
+                    note = f"camera: {summary(self.skills.state)}" if s["skill"] == "detect_objects" else ""
+                if s["skill"] == "check_zone" and status == SUCCESS:
+                    occ = self.skills.check_result
+                    note = f"camera: {s['zone']} is " + (f"OCCUPIED by {occ}" if occ else "free")
+                self.out(f"{label} {'.' * max(2, 38 - len(label))} {status}" + (f"   [{note}]" if note else ""))
+                if status != SUCCESS:
+                    self.out("\nTASK FAILED\n")
+                    return
+                if s["skill"] == "check_zone" and self.skills.check_result:
+                    occ = self.skills.check_result
+                    nxt = next((q for q in queue if q["skill"] == "pick"), None)
+                    if nxt and nxt["object"] == occ:
+                        queue = skip_task(queue, occ)
+                        self.out(f"    -> {occ} is already in {s['zone']}: skip pick/place")
+                    elif n_auto < MAX_AUTO:
+                        extra = blocker_steps(occ)
+                        queue[0:0] = extra
+                        n_auto += 1
+                        self.out(f"    -> camera found an obstacle: inserting pick({occ}), move_to_temporary({occ})")
+            self.out("\nTASK SUCCESS\n")
+        finally:
+            self.busy = False
+
+
+def main():
+    rclpy.init()
+    node = SkillExecutor()
+    ex = MultiThreadedExecutor(num_threads=4)
+    ex.add_node(node)
+    ex.spin()
+    rclpy.shutdown()

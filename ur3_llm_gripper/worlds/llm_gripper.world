@@ -1,0 +1,18 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="llm_gripper_world">
+
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <plugin
+      name="gazebo_link_attacher"
+      filename="/home/le/ws3/install/ros2_linkattacher/lib/libgazebo_link_attacher.so"/>
+
+  </world>
+</sdf>

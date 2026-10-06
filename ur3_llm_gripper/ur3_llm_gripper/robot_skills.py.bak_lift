@@ -1,0 +1,1079 @@
+"""Robot skills (Bai 03): gripper that + camera. Moi chuyen dong deu qua MoveIt 2.
+Khong dich chuyen vat bang tay: khoi chi di chuyen nho ma sat cua ngon gripper trong Gazebo."""
+import json
+import math
+import time
+
+from geometry_msgs.msg import Pose
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
+from moveit_msgs.msg import (AttachedCollisionObject, CollisionObject, Constraints, JointConstraint,
+                             MoveItErrorCodes, OrientationConstraint, PlanningScene, PositionConstraint)
+from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath
+from rclpy.action import ActionClient
+from sensor_msgs.msg import JointState
+from shape_msgs.msg import SolidPrimitive
+from std_srvs.srv import Trigger
+from linkattacher_msgs.srv import AttachLink, DetachLink
+from gazebo_msgs.srv import GetModelState
+from std_msgs.msg import Float64MultiArray
+
+from ur3_llm_gripper.vision import free_temp_slot, zone_occupant
+
+SUCCESS = "SUCCESS"
+FAILED = "FAILED"
+INVALID_OBJECT = "INVALID_OBJECT"
+INVALID_ZONE = "INVALID_ZONE"
+PLANNING_FAILED = "PLANNING_FAILED"
+NOT_FOUND = "NOT_FOUND"            # camera khong thay vat
+GRASP_FAILED = "GRASP_FAILED"      # kep hut (do do rong ngon tay)
+ZONE_OCCUPIED = "ZONE_OCCUPIED"
+NO_FREE_SPACE = "NO_FREE_SPACE"
+
+FINGERS = ("finger_left_joint", "finger_right_joint")
+
+
+def qmul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by, aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw, aw * bw - ax * bx - ay * by - az * bz)
+
+
+class RobotSkills:
+    def __init__(self, node, scene, cbg=None):
+        self.n, self.s = node, scene
+        self.frame, self.ee = scene["frame_id"], scene["ee_link"]
+        self.group = scene["group_name"]
+        self.tcp, self.appr = scene["tcp_offset"], scene["approach_height"]
+        self.size = scene["cube_size"]
+        self.cube_z = scene["table_top_z"] + self.size / 2
+        self.vel = scene.get("velocity_scaling", 0.3)
+        self.grip = scene["gripper"]
+        self.places = {**scene["zones"], **scene["temp_positions"]}
+        self.cube_names = [f"{c}_cube" for c in scene["colors"]]
+        self.held = None
+        self.attached_pair = None
+        self.at_home = False
+        self.ready = False
+        self.state = {"objects": {}, "missing": list(self.cube_names)}
+        self.state_t = 0.0
+        self.dirty = True            # true: vat co the da bi dich chuyen, can chup lai
+        self.check_result = None     # ket qua check_zone: ten vat dang chiem vung (hoac None)
+        self.free_slot = None
+        self.js = {}
+        self.mg = ActionClient(node, MoveGroup, "move_action", callback_group=cbg)
+        self.ex = ActionClient(node, ExecuteTrajectory, "execute_trajectory", callback_group=cbg)
+        self.cart = node.create_client(GetCartesianPath, "compute_cartesian_path", callback_group=cbg)
+        self.aps = node.create_client(ApplyPlanningScene, "apply_planning_scene", callback_group=cbg)
+        self.cam = node.create_client(
+            Trigger, "detect_objects", callback_group=cbg
+        )
+
+        # IFRA LinkAttacher:
+        # tao fixed joint giua end-effector va cube trong Gazebo.
+        self.attach_cli = node.create_client(
+            AttachLink, "/ATTACHLINK", callback_group=cbg
+        )
+        self.detach_cli = node.create_client(
+            DetachLink, "/DETACHLINK", callback_group=cbg
+        )
+
+        # Gazebo verification: CHI DOC pose, khong thay doi pose.
+        self.gazebo_state = node.create_client(
+            GetModelState,
+            "/gazebo/get_model_state",
+            callback_group=cbg,
+        )
+
+        self.grip_pub = node.create_publisher(
+            Float64MultiArray, "/gripper_controller/commands", 10
+        )
+        node.create_subscription(JointState, "joint_states", self._on_js, 10, callback_group=cbg)
+
+    # ---------- ha tang ----------
+    def _on_js(self, msg):
+        for n, v in zip(msg.name, msg.position):
+            self.js[n] = v
+
+    def _wait(self, fut, timeout):
+        t0 = time.time()
+        while not fut.done():
+            if time.time() - t0 > timeout:
+                return False
+            time.sleep(0.02)
+        return True
+
+    def _pose(self, xyz, yaw=0.0):
+        p = Pose()
+        p.position.x, p.position.y, p.position.z = map(float, xyz)
+        qz = (0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2))
+        q = qmul(qz, tuple(self.s["grasp_orientation"]))
+        p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w = q
+        return p
+
+    def _box(self, name, size, xyz, yaw=0.0, frame=None, op=CollisionObject.ADD):
+        co = CollisionObject()
+        co.id, co.operation = name, op
+        co.header.frame_id = frame or self.frame
+        p = Pose()
+        p.position.x, p.position.y, p.position.z = map(float, xyz)
+        p.orientation.z, p.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+        co.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=list(map(float, size)))]
+        co.primitive_poses = [p]
+        return co
+
+    def _remove(self, name):
+        co = CollisionObject()
+        co.id, co.operation = name, CollisionObject.REMOVE
+        co.header.frame_id = self.frame
+        return co
+
+    def _apply(self, world=(), attached=()):
+        ps = PlanningScene()
+        ps.is_diff = True
+        ps.world.collision_objects = list(world)
+        ps.robot_state.is_diff = True
+        ps.robot_state.attached_collision_objects = list(attached)
+        fut = self.aps.call_async(ApplyPlanningScene.Request(scene=ps))
+        if not self._wait(fut, 5.0):
+            print("    apply_planning_scene: TIMEOUT", flush=True)
+            return False
+        if not fut.result().success:
+            print("    apply_planning_scene: success=False", flush=True)
+        return fut.result().success
+
+    def ensure_ready(self):
+        if self.ready:
+            return True
+        if not (self.mg.wait_for_server(10.0) and self.aps.wait_for_service(10.0)
+                and self.cart.wait_for_service(10.0) and self.ex.wait_for_server(10.0)):
+            return False
+        top = self.s["table_top_z"]
+        self.ready = self._apply(world=[self._box("table", (1.2, 1.2, 0.04), (0, 0, top - 0.02))])
+        return self.ready
+
+    # ---------- MoveIt 2 ----------
+    def _run_goal(self, goal):
+        r = FAILED
+        for attempt in range(3):          # RRTConnect ngau nhien: thu lai neu duong khong hop le
+            r = self._run_goal_once(goal)
+            if r == SUCCESS or self.last_code not in (-1, -2):
+                return r
+            if attempt < 2:
+                print(f"    plan khong hop le (code {self.last_code}), thu lai {attempt + 2}/3", flush=True)
+        return r
+
+    def _run_goal_once(self, goal):
+        self.last_code = 0
+        fut = self.mg.send_goal_async(goal)
+        if not self._wait(fut, 10.0) or not fut.result().accepted:
+            return FAILED
+        rf = fut.result().get_result_async()
+        if not self._wait(rf, 90.0):
+            return FAILED
+        code = rf.result().result.error_code.val
+        self.last_code = code
+        if code == MoveItErrorCodes.SUCCESS:
+            self.at_home = False
+            return SUCCESS
+        return PLANNING_FAILED if code == MoveItErrorCodes.PLANNING_FAILED else FAILED
+
+    def _base_goal(self):
+        g = MoveGroup.Goal()
+        r = g.request
+        r.group_name = self.group
+        r.num_planning_attempts = 10
+        r.allowed_planning_time = 5.0
+        r.max_velocity_scaling_factor = r.max_acceleration_scaling_factor = self.vel
+        g.planning_options.plan_only = False
+        g.planning_options.planning_scene_diff.is_diff = True
+        return g
+
+    def _move_pose(self, xyz, yaw=0.0):
+        g = self._base_goal()
+        pose = self._pose(xyz, yaw)
+        pc = PositionConstraint()
+        pc.header.frame_id, pc.link_name, pc.weight = self.frame, self.ee, 1.0
+        pc.constraint_region.primitives = [SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[0.005])]
+        pc.constraint_region.primitive_poses = [pose]
+        oc = OrientationConstraint()
+        oc.header.frame_id, oc.link_name, oc.weight = self.frame, self.ee, 1.0
+        oc.orientation = pose.orientation
+        oc.absolute_x_axis_tolerance = oc.absolute_y_axis_tolerance = oc.absolute_z_axis_tolerance = 0.05
+        c = Constraints()
+        c.position_constraints, c.orientation_constraints = [pc], [oc]
+        g.request.goal_constraints = [c]
+        return self._run_goal(g)
+
+    def _move_joints(self, joints):
+        g = self._base_goal()
+        c = Constraints()
+        for n, v in zip(self.s["joint_names"], joints):
+            jc = JointConstraint()
+            jc.joint_name, jc.position, jc.weight = n, float(v), 1.0
+            jc.tolerance_above = jc.tolerance_below = 0.01
+            c.joint_constraints.append(jc)
+        g.request.goal_constraints = [c]
+        return self._run_goal(g)
+
+    def _unwrap(self, traj):
+        """Cong/tru 2*pi de quy dao lien mach voi vi tri that (tranh PATH_TOLERANCE_VIOLATED)."""
+        jt = traj.joint_trajectory
+        prev = [self.js.get(n) for n in jt.joint_names]
+        for pt in jt.points:
+            pos = list(pt.positions)
+            for k, v in enumerate(pos):
+                if prev[k] is not None:
+                    v -= 2 * math.pi * round((v - prev[k]) / (2 * math.pi))
+                pos[k] = v
+                prev[k] = v
+            pt.positions = pos
+
+    def _cartesian(self, xyz, yaw=0.0):
+        """Ha/nang thang qua compute_cartesian_path (cho phep cham vat khi kep)."""
+        req = GetCartesianPath.Request()
+        req.header.frame_id = self.frame
+        req.start_state.is_diff = True
+        req.group_name, req.link_name = self.group, self.ee
+        req.waypoints = [self._pose(xyz, yaw)]
+        req.max_step, req.jump_threshold, req.avoid_collisions = 0.005, 0.0, False
+        if hasattr(req, "max_velocity_scaling_factor"):
+            req.max_velocity_scaling_factor = float(self.vel)
+            req.max_acceleration_scaling_factor = float(self.vel) * 0.5
+        fut = self.cart.call_async(req)
+        if not self._wait(fut, 10.0):
+            return FAILED
+        res = fut.result()
+        if res.fraction < 0.95:
+            return PLANNING_FAILED
+        self._unwrap(res.solution)
+        goal = ExecuteTrajectory.Goal()
+        goal.trajectory = res.solution
+        gf = self.ex.send_goal_async(goal)
+        if not self._wait(gf, 10.0) or not gf.result().accepted:
+            return FAILED
+        rf = gf.result().get_result_async()
+        if not self._wait(rf, 60.0):
+            return FAILED
+        ok = rf.result().result.error_code.val == MoveItErrorCodes.SUCCESS
+        if ok:
+            self.at_home = False
+        return SUCCESS if ok else FAILED
+
+    def _seq(self, *steps):
+        for st in steps:
+            r = st()
+            if r != SUCCESS:
+                return r
+        return SUCCESS
+
+    # ---------- IFRA LinkAttacher ----------
+    def _attach_object(self, obj):
+        if not self.attach_cli.wait_for_service(5.0):
+            print(
+                "    ATTACH: /ATTACHLINK khong ton tai",
+                flush=True,
+            )
+            return FAILED
+
+        # Robot model trong Gazebo thuong la "ur".
+        # Thu lan luot cac end-effector link co the co trong model.
+        robot_models = ["ur", "ur3e"]
+        robot_links = [
+            self.ee,
+            "gripper_base_link",
+            "tool0",
+            "wrist_3_link",
+        ]
+
+        # Cube cua bai thuong co link "link".
+        cube_links = [
+            "link",
+            obj,
+            f"{obj}_link",
+        ]
+
+        for model_name in robot_models:
+            for robot_link in robot_links:
+                if not robot_link:
+                    continue
+
+                for cube_link in cube_links:
+                    req = AttachLink.Request()
+                    req.model1_name = model_name
+                    req.link1_name = robot_link
+                    req.model2_name = obj
+                    req.link2_name = cube_link
+
+                    print(
+                        f"    ATTACH TRY: "
+                        f"{model_name}::{robot_link} <-> "
+                        f"{obj}::{cube_link}",
+                        flush=True,
+                    )
+
+                    fut = self.attach_cli.call_async(req)
+
+                    if not self._wait(fut, 5.0):
+                        continue
+
+                    res = fut.result()
+
+                    if res and res.success:
+                        self.attached_pair = (
+                            model_name,
+                            robot_link,
+                            obj,
+                            cube_link,
+                        )
+
+                        print(
+                            f"    ATTACH OK: "
+                            f"{model_name}::{robot_link} <-> "
+                            f"{obj}::{cube_link}",
+                            flush=True,
+                        )
+                        return SUCCESS
+
+                    if res:
+                        print(
+                            f"    ATTACH FAIL: {res.message}",
+                            flush=True,
+                        )
+
+        print(
+            f"    ATTACH: khong tim duoc link hop le cho {obj}",
+            flush=True,
+        )
+
+        return FAILED
+
+    def _detach_object(self, obj):
+        if not self.detach_cli.wait_for_service(5.0):
+            print(
+                "    DETACH: /DETACHLINK khong ton tai",
+                flush=True,
+            )
+            return FAILED
+
+        # Dung CHINH XAC cap link da attach thanh cong.
+        if self.attached_pair and self.attached_pair[2] == obj:
+            model1, link1, model2, link2 = self.attached_pair
+        else:
+            model1 = "ur"
+            link1 = self.ee
+            model2 = obj
+            link2 = "link"
+
+        req = DetachLink.Request()
+        req.model1_name = model1
+        req.link1_name = link1
+        req.model2_name = model2
+        req.link2_name = link2
+
+        print(
+            f"    DETACH TRY: "
+            f"{model1}::{link1} <-> {model2}::{link2}",
+            flush=True,
+        )
+
+        fut = self.detach_cli.call_async(req)
+
+        if not self._wait(fut, 10.0):
+            print("    DETACH: timeout", flush=True)
+            return FAILED
+
+        res = fut.result()
+
+        if res and res.success:
+            print(
+                f"    DETACH OK: "
+                f"{model1}::{link1} <-> {model2}::{link2}",
+                flush=True,
+            )
+            self.attached_pair = None
+            return SUCCESS
+
+        if res:
+            print(
+                f"    DETACH FAIL: {res.message}",
+                flush=True,
+            )
+
+        return FAILED
+
+    def _remove_held_from_planning_scene(self, obj):
+        """
+        Xoa HOAN TOAN representation cua object dang cam khoi
+        Planning Scene:
+          - world collision object
+          - attached collision object
+
+        KHONG goi /DETACHLINK.
+        Vat van duoc giu that boi IFRA LinkAttacher trong Gazebo.
+        """
+        aco = AttachedCollisionObject()
+        aco.link_name = self.ee
+        aco.object.id = obj
+        aco.object.operation = CollisionObject.REMOVE
+
+        world_remove = self._remove(obj)
+
+        ok = self._apply(
+            world=[world_remove],
+            attached=[aco],
+        )
+
+        if ok:
+            print(
+                f"    MOVEIT: removed {obj} from WORLD + ATTACHED scene",
+                flush=True,
+            )
+        else:
+            print(
+                f"    MOVEIT: failed removing {obj} from planning scene",
+                flush=True,
+            )
+
+        return ok
+
+    # ---------- Gazebo verification ----------
+    def _gazebo_model_pose(self, name):
+        if not self.gazebo_state.wait_for_service(3.0):
+            print("    GAZEBO: /gazebo/get_model_state khong co", flush=True)
+            return None
+
+        req = GetModelState.Request()
+        req.model_name = name
+        req.relative_entity_name = "world"
+
+        fut = self.gazebo_state.call_async(req)
+        if not self._wait(fut, 5.0):
+            print("    GAZEBO: get_model_state timeout", flush=True)
+            return None
+
+        res = fut.result()
+        if res is None or not res.success:
+            print(
+                f"    GAZEBO: khong doc duoc {name}: "
+                f"{getattr(res, 'status_message', '')}",
+                flush=True,
+            )
+            return None
+
+        return res.pose
+
+    def _verify_lift(self, obj, z_before):
+        pose = self._gazebo_model_pose(obj)
+        if pose is None:
+            return False
+
+        dz = float(pose.position.z) - float(z_before)
+
+        print(
+            f"    VERIFY PICK: {obj} dz={dz:.4f} m "
+            f"(z_before={z_before:.4f}, z_after={pose.position.z:.4f})",
+            flush=True,
+        )
+
+        # Cube phải thực sự rời mặt bàn.
+        return dz > 0.03
+
+    def _verify_place(self, obj, target_xy):
+        pose = self._gazebo_model_pose(obj)
+        if pose is None:
+            return False
+
+        dx = float(pose.position.x) - float(target_xy[0])
+        dy = float(pose.position.y) - float(target_xy[1])
+
+        print(
+            f"    VERIFY PLACE: {obj} "
+            f"xy=({pose.position.x:.4f},{pose.position.y:.4f}) "
+            f"target=({target_xy[0]:.4f},{target_xy[1]:.4f})",
+            flush=True,
+        )
+
+        return (
+            abs(dx) < 0.06
+            and abs(dy) < 0.06
+            and pose.position.z < self.cube_z + 0.05
+        )
+
+    # ---------- gripper that (dieu khien LUC) ----------
+    def _grip_effort(self, f):
+        if self.grip_pub.get_subscription_count() == 0:
+            print(
+                "    GRIPPER: chua co controller /gripper_controller",
+                flush=True,
+            )
+            return False
+
+        self.grip_pub.publish(
+            Float64MultiArray(data=[float(f), float(f)])
+        )
+        return True
+
+    def _grip_hold(self, f, duration):
+        """Duy tri effort lien tuc trong khi kep/mo."""
+        if not self._grip_effort(f):
+            return False
+
+        t_end = time.time() + float(duration)
+
+        while time.time() < t_end:
+            self.grip_pub.publish(
+                Float64MultiArray(data=[float(f), float(f)])
+            )
+            time.sleep(0.05)
+
+        return True
+
+    def finger_d(self):
+        v = [self.js.get(n) for n in FINGERS]
+        return None if None in v else v
+
+    def open_gripper(self):
+        effort = abs(float(self.grip["effort"]))
+        duration = max(0.8, float(self.grip["settle_s"]))
+
+        # Mo: thu -effort
+        if not self._grip_hold(-effort, duration):
+            return FAILED
+
+        return SUCCESS
+
+    def close_gripper(self):
+        """
+        Kep that:
+        - dung luc manh hon;
+        - tu kiem tra huong chuyen dong cua hai ngon;
+        - giu effort lien tuc trong luc robot nang.
+        """
+        effort = max(50.0, abs(float(self.grip["effort"])))
+        duration = max(1.2, float(self.grip["settle_s"]))
+
+        before = self.finger_d()
+        before_sum = (
+            sum(before) if before is not None else None
+        )
+
+        # Thu chieu + truoc
+        self._grip_hold(effort, 0.7)
+        time.sleep(0.15)
+
+        after = self.finger_d()
+        after_sum = (
+            sum(after) if after is not None else None
+        )
+
+        # Neu + khong lam gap dong lai, dao chieu.
+        if (
+            before_sum is not None
+            and after_sum is not None
+            and after_sum < before_sum + 0.0005
+        ):
+            print(
+                "    GRIPPER: doi chieu dong (-effort)",
+                flush=True,
+            )
+            effort = -effort
+
+        # Giu luc kep trong toan bo thoi gian con lai
+        self._grip_hold(effort, duration)
+
+        return SUCCESS
+
+    def _d_str(self):
+        d = self.finger_d()
+        return "n/a" if d is None else f"trai={d[0]:.4f} phai={d[1]:.4f}"
+
+    def _holding(self):
+        return self.held is not None
+
+    def _d_str(self):
+        d = self.finger_d()
+        return "n/a" if d is None else f"trai={d[0]:.4f} phai={d[1]:.4f}"
+
+    def _holding(self):
+        """Khong dung joint position lam ket luan gắp.
+        Viec gap that duoc xac nhan bang pose vat trong Gazebo sau khi nang.
+        """
+        return self.held is not None
+
+    def finger_d(self):
+        v = [self.js.get(n) for n in FINGERS]
+        return None if None in v else v
+
+    def open_gripper(self):
+        if not self._grip_effort(-self.grip["effort"]):
+            return FAILED
+        time.sleep(self.grip["settle_s"])
+        return SUCCESS
+
+    def close_gripper(self):
+        if not self._grip_effort(self.grip["effort"]):
+            return FAILED
+        time.sleep(self.grip["settle_s"])
+        return SUCCESS
+
+    def _d_str(self):
+        d = self.finger_d()
+        return "n/a" if d is None else f"trai={d[0]:.4f} phai={d[1]:.4f}"
+
+    def _holding(self):
+        """Dang kep vat khi CA HAI ngon dung lai quanh vat va tong do rong khop be ngang khoi."""
+        d = self.finger_d()
+        if d is None:
+            return False
+        g = self.grip
+        if not all(g["hold_min"] <= x <= g["hold_max"] for x in d):
+            return False
+        expected = 2 * g["finger_open_inner"] - self.size
+        return abs(d[0] + d[1] - expected) <= g["width_tol"]
+
+    # ---------- camera ----------
+    def _query_camera(self):
+        if not self.cam.wait_for_service(5.0):
+            print("    CAMERA: khong co service /detect_objects", flush=True)
+            return None
+        fut = self.cam.call_async(Trigger.Request())
+        if not self._wait(fut, 8.0):
+            return None
+        r = fut.result()
+        if not r.success:
+            print(f"    CAMERA: {r.message}", flush=True)
+            return None
+        return json.loads(r.message)
+
+    def _sync_scene(self, st):
+        """Cap nhat planning scene theo CAMERA (vi tri that cua cac khoi), tru khoi dang cam."""
+        world = []
+        for n in self.cube_names:
+            if n == self.held:
+                continue
+            o = st["objects"].get(n)
+            if o:
+                world.append(self._box(n, (self.size,) * 3, (o["x"], o["y"], self.cube_z), o["yaw"]))
+            else:
+                world.append(self._remove(n))
+        self._apply(world=world)
+
+    def _fresh_state(self):
+        return (self.at_home and not self.dirty and time.time() - self.state_t < 10.0)
+
+    # ---------- SKILLS ----------
+    def home(self):
+        if not self.ensure_ready():
+            return FAILED
+        r = self._move_joints(self.s["home_joints"])
+        if r == SUCCESS:
+            self.at_home = True
+        return r
+
+    def detect_objects(self):
+        """Ve tu the quan sat (home) roi chup anh, cap nhat trang thai cac khoi tu camera."""
+        if not self.ensure_ready():
+            return FAILED
+        if self.held:                     # dang cam vat: khong chup (tay robot che camera), dung trang thai gan nhat
+            return SUCCESS
+        if self._fresh_state():
+            return SUCCESS
+        if not self.at_home:
+            r = self.home()
+            if r != SUCCESS:
+                return r
+        time.sleep(self.s.get("settle_s", 0.8))
+        st = self._query_camera()
+        if st is None:
+            return FAILED
+        self.state, self.state_t, self.dirty = st, time.time(), False
+        self._sync_scene(st)
+        return SUCCESS
+
+    def check_zone(self, zone):
+        if zone not in self.places:
+            return INVALID_ZONE
+        r = self.detect_objects()
+        if r != SUCCESS:
+            return r
+        self.check_result = zone_occupant(self.state, zone)
+        return SUCCESS
+
+    def find_free_position(self):
+        r = self.detect_objects()
+        if r != SUCCESS:
+            return r
+        self.free_slot = free_temp_slot(self.state, self.s, exclude=self.held)
+        return SUCCESS if self.free_slot else NO_FREE_SPACE
+
+    def pick(self, obj):
+        if obj not in self.cube_names:
+            return INVALID_OBJECT
+
+        if self.held:
+            return FAILED
+
+        r = self.detect_objects()
+        if r != SUCCESS:
+            return r
+
+        o = self.state["objects"].get(obj)
+        if not o:
+            return NOT_FOUND
+
+        x, y = o["x"], o["y"]
+        yaw = o["yaw"] if self.s.get("use_yaw") else 0.0
+
+        grasp = (
+            self.cube_z
+            + self.tcp
+            + self.s.get("grasp_z_offset", 0.0)
+        )
+        pre = self.cube_z + self.tcp + self.appr
+
+        # ========================================================
+        # QUAN TRONG:
+        # Cube dang la WORLD COLLISION OBJECT do camera them vao.
+        # Khi pick, ngon tay PHAI cham cube -> cho phep tiep xuc.
+        # Xoa cube khoi WORLD collision truoc khi approach.
+        # ========================================================
+        if not self._apply(world=[self._remove(obj)]):
+            print(
+                f"    MOVEIT: khong remove collision object {obj}",
+                flush=True,
+            )
+            return FAILED
+
+        # ========================================================
+        # Approach + grasp
+        # ========================================================
+        r = self._seq(
+            lambda: self.open_gripper(),
+            lambda: self._move_pose([x, y, pre], yaw),
+            lambda: self._cartesian([x, y, grasp], yaw),
+        )
+
+        if r != SUCCESS:
+            # Neu pick fail thi dua cube tro lai Planning Scene
+            self._apply(
+                world=[
+                    self._box(
+                        obj,
+                        (self.size,) * 3,
+                        (x, y, self.cube_z),
+                        yaw,
+                    )
+                ]
+            )
+            return r
+
+        r = self.close_gripper()
+
+        if r != SUCCESS:
+            self._apply(
+                world=[
+                    self._box(
+                        obj,
+                        (self.size,) * 3,
+                        (x, y, self.cube_z),
+                        yaw,
+                    )
+                ]
+            )
+            return r
+
+        time.sleep(0.3)
+
+        # ========================================================
+        # ATTACH VAT THAT TRONG GAZEBO
+        # ========================================================
+        r = self._attach_object(obj)
+
+        if r != SUCCESS:
+            print(
+                f"    GRIPPER: ATTACH {obj} FAILED",
+                flush=True,
+            )
+            self.open_gripper()
+
+            self._apply(
+                world=[
+                    self._box(
+                        obj,
+                        (self.size,) * 3,
+                        (x, y, self.cube_z),
+                        yaw,
+                    )
+                ]
+            )
+
+            self._move_pose([x, y, pre], yaw)
+            return GRASP_FAILED
+
+        # ========================================================
+        # ATTACH OBJECT VAO PLANNING SCENE
+        #
+        # De MoveIt biet cube bay gio di cung end-effector,
+        # thay vi coi no la obstacle co dinh tren ban.
+        # ========================================================
+        aco = AttachedCollisionObject()
+        aco.link_name = self.ee
+        aco.touch_links = list(self.s["touch_links"])
+
+        aco.object = self._box(
+            obj,
+            (self.size,) * 3,
+            (0.0, 0.0, self.tcp),
+            frame=self.ee,
+        )
+
+        if not self._apply(attached=[aco]):
+            print(
+                "    MOVEIT: attach collision object FAILED",
+                flush=True,
+            )
+            self._detach_object(obj)
+            self.open_gripper()
+            self._move_pose([x, y, pre], yaw)
+            return FAILED
+
+        time.sleep(0.4)
+
+        # ========================================================
+        # Lift bang MoveGroup pose planning
+        # ========================================================
+        r = self._move_pose([x, y, pre], yaw)
+
+        if r != SUCCESS:
+            print(
+                "    PICK: lift failed",
+                flush=True,
+            )
+
+            aco.object.operation = CollisionObject.REMOVE
+            self._apply(attached=[aco])
+
+            self._detach_object(obj)
+            self.open_gripper()
+            return r
+
+        print(
+            f"    GRIPPER: {obj} da duoc ATTACH vao "
+            f"{self.attached_pair[1]}",
+            flush=True,
+        )
+
+        self.held = obj
+        self.dirty = True
+
+        return SUCCESS
+
+    def place(self, obj, zone):
+        if obj not in self.cube_names:
+            return INVALID_OBJECT
+
+        if zone not in self.places:
+            return INVALID_ZONE
+
+        if self.held != obj:
+            return FAILED
+
+        if not self.ensure_ready():
+            return FAILED
+
+        occ = zone_occupant(
+            self.state,
+            zone,
+            exclude=obj,
+        )
+
+        if occ:
+            return ZONE_OCCUPIED
+
+        x, y = self.places[zone]
+
+        grasp = self.cube_z + self.tcp + 0.004
+        pre = self.cube_z + self.tcp + self.appr
+
+        # 1. Di toi tren zone
+        r = self._seq(
+            lambda: self._move_pose([x, y, pre]),
+            lambda: self._cartesian([x, y, grasp]),
+        )
+
+        if r != SUCCESS:
+            return r
+
+        # 2. DETACH vat that trong Gazebo
+        r = self._detach_object(obj)
+
+        if r != SUCCESS:
+            return FAILED
+
+        # 3. Mo gripper
+        r = self.open_gripper()
+
+        if r != SUCCESS:
+            return r
+
+        time.sleep(0.8)
+
+        # 4. Cho cube roi on dinh trong Gazebo.
+        time.sleep(0.4)
+
+        # 5. Rut len bang MoveGroup pose planning.
+        r = self._move_pose([x, y, pre])
+
+        if r == SUCCESS:
+            self.held = None
+            self.dirty = True
+
+        return r
+
+    def move_to_temporary(self, obj):
+        if obj not in self.cube_names:
+            return INVALID_OBJECT
+
+        if self.held != obj:
+            print(
+                f"    TEMP: {obj} is not currently held",
+                flush=True,
+            )
+            return FAILED
+
+        r = self.find_free_position()
+        if r != SUCCESS:
+            return r
+
+        slot = self.free_slot
+
+        # free_temp_slot() co the tra:
+        #   (name, x, y)
+        #   (x, y)
+        #   "temp_1"
+        if isinstance(slot, str):
+            slot_name = slot
+            if slot_name not in self.places:
+                print(
+                    f"    TEMP: unknown slot {slot_name}",
+                    flush=True,
+                )
+                return NO_FREE_SPACE
+            x, y = self.places[slot_name]
+
+        elif len(slot) == 3:
+            slot_name, x, y = slot
+            x, y = float(x), float(y)
+
+        elif len(slot) == 2:
+            slot_name = None
+            x, y = slot
+            x, y = float(x), float(y)
+
+        else:
+            print(
+                f"    TEMP: invalid slot = {slot}",
+                flush=True,
+            )
+            return NO_FREE_SPACE
+
+        # ========================================================
+        # QUAN TRONG NHAT:
+        # Cube van ATTACH THAT trong Gazebo.
+        # Chi xoa representation cua cube khoi MoveIt.
+        # ========================================================
+        if not self._remove_held_from_planning_scene(obj):
+            return FAILED
+
+        safe_z = (
+            self.s["table_top_z"]
+            + self.appr
+            + self.size
+            + 0.12
+        )
+
+        pre = self.cube_z + self.tcp + self.appr
+
+        print(
+            f"    TEMP: moving {obj} -> "
+            f"{slot_name if slot_name else 'temporary'} "
+            f"at ({x:.3f}, {y:.3f})",
+            flush=True,
+        )
+
+        # ========================================================
+        # 1. Len cao bang MoveIt
+        # ========================================================
+        r = self._move_pose([x, y, safe_z])
+
+        if r != SUCCESS:
+            print(
+                "    TEMP: failed moving to safe height",
+                flush=True,
+            )
+            return r
+
+        # ========================================================
+        # 2. Di chuyen ngang o do cao an toan
+        #    Cube van dang ATTACH that voi robot.
+        # ========================================================
+        if r == SUCCESS:
+            r = self._move_pose([x, y, pre])
+
+        if r != SUCCESS:
+            return r
+
+        # ========================================================
+        # 3. DETACH THAT trong Gazebo
+        # ========================================================
+        r = self._detach_object(obj)
+
+        if r != SUCCESS:
+            return r
+
+        # ========================================================
+        # 4. Mo gripper
+        # ========================================================
+        r = self.open_gripper()
+
+        if r != SUCCESS:
+            return r
+
+        time.sleep(0.8)
+
+        # ========================================================
+        # 5. Rut robot len
+        # ========================================================
+        r = self._move_pose([x, y, safe_z])
+
+        if r != SUCCESS:
+            return r
+
+        # ========================================================
+        # 6. Them cube lai vao Planning Scene tai temp
+        # ========================================================
+        if not self._apply(
+            world=[
+                self._box(
+                    obj,
+                    (self.size,) * 3,
+                    (x, y, self.cube_z),
+                )
+            ]
+        ):
+            return FAILED
+
+        self.held = None
+        self.free_slot = None
+        self.dirty = True
+
+        print(
+            f"    TEMP PLACE OK: {obj} -> "
+            f"({x:.3f}, {y:.3f})",
+            flush=True,
+        )
+
+        return SUCCESS
+
+

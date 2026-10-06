@@ -1,0 +1,59 @@
+# Toa do trong frame base_link (= world cua Gazebo). Vung lam viec o phia x AM.
+frame_id: base_link
+group_name: ur_manipulator
+ee_link: tool0
+touch_links: [tool0, wrist_3_link, wrist_2_link, wrist_1_link, gripper_base_link, finger_left_link, finger_right_link]
+joint_names: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]
+home_joints: [0.0, -1.5707, 0.0, -1.5707, 0.0, 0.0]
+table_top_z: -0.01
+cube_size: 0.04
+tcp_offset: 0.09          # tool0 -> tam khoi khi gap (xem urdf/gripper.xacro)
+approach_height: 0.10
+grasp_z_offset: 0.0       # chinh +/- neu ngon gripper cham ban hoac gap qua cao
+grasp_orientation: [0.0, 1.0, 0.0, 0.0]   # tool huong xuong; ngon gripper dong theo truc y cua world
+velocity_scaling: 0.3
+settle_s: 0.8             # doi robot dung han truoc khi chup anh
+use_yaw: false            # true: xoay gripper theo goc khoi do camera uoc luong
+
+gripper:                  # gui LUC truc tiep (effort), khong PID: kep bang luc huu han + ma sat
+  effort: 4.0             # luc kep moi ngon (N)
+  finger_open_inner: 0.039   # nua khoang cach giua 2 ma ngon khi mo (m) - xem urdf/gripper.xacro
+  hold_min: 0.010         # moi ngon phai nam trong [hold_min, hold_max] khi dang kep vat
+  hold_max: 0.030         # (khep het khong co vat -> ~0.035 -> bi loai)
+  width_tol: 0.008        # |dL + dR - (2*finger_open_inner - cube_size)| <= width_tol
+  settle_s: 1.0
+
+zone_size: 0.08
+zone_tol: 0.012
+zones:                    # ban do khu lam viec (vi tri CAC VUNG); vi tri CAC KHOI do camera quyet dinh
+  zone_a: [-0.25, -0.15]
+  zone_b: [-0.25,  0.00]
+  zone_c: [-0.25,  0.15]
+temp_positions:           # cac cho dat tam; camera chon cho nao dang trong
+  temp_1: [-0.30,  0.27]
+  temp_2: [-0.30, -0.27]
+  temp_3: [-0.18,  0.27]
+  temp_4: [-0.18, -0.27]
+
+spawn_area: {x_min: -0.42, x_max: -0.34, y_min: -0.14, y_max: 0.14, min_sep: 0.08}
+
+camera:                   # camera tren cao nhin xuong ban (Gazebo: x phia truoc, pitch=pi/2 -> nhin xuong)
+  topic: /overhead/cam/image_raw
+  x: -0.33
+  y: 0.0
+  z: 0.90
+  roll: 0.0
+  pitch: 1.5708
+  yaw: 0.0
+  hfov: 1.2
+  width: 640
+  height: 480
+
+perception:
+  min_area: 120           # pixel
+colors:                   # HSV (OpenCV: H 0-179): [Hlo,Slo,Vlo,Hhi,Shi,Vhi]
+  red:    [[0, 130, 40, 8, 255, 255], [172, 130, 40, 179, 255, 255]]
+  yellow: [[22, 130, 40, 38, 255, 255]]
+  blue:   [[105, 130, 40, 128, 255, 255]]
+  green:  [[40, 100, 40, 85, 255, 255]]
+  purple: [[130, 80, 40, 170, 255, 255]]

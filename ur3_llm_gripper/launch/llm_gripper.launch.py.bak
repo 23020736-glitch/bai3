@@ -1,0 +1,84 @@
+import os
+
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    TimerAction,
+    ExecuteProcess,
+)
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+
+
+def generate_launch_description():
+
+    scenario = LaunchConfiguration("scenario")
+
+    # ==========================================================
+    # LAUNCH GỐC CỦA BÀI:
+    # GIỮ NGUYÊN overhead_camera + 3 cube + 3 zone + temp...
+    # ==========================================================
+    core = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(
+                os.path.expanduser("~"),
+                "ws3/src/ur3_llm_gripper/launch/llm_gripper_core.launch.py",
+            )
+        ),
+        launch_arguments={
+            "scenario": scenario,
+        }.items(),
+    )
+
+    pkg = os.path.join(
+        os.path.expanduser("~"),
+        "ws3/src/ur3_llm_gripper",
+    )
+
+    # ==========================================================
+    # CHỈ THÊM 2 CUBE MỚI
+    # KHÔNG THÊM/XÓA CAMERA
+    # ==========================================================
+    green = ExecuteProcess(
+        cmd=[
+            "ros2", "run", "gazebo_ros", "spawn_entity.py",
+            "-file",
+            os.path.join(pkg, "models", "green_cube.sdf"),
+            "-entity", "green_cube",
+            "-x", "-0.39",
+            "-y", "-0.10",
+            "-z", "0.02",
+        ],
+        output="screen",
+    )
+
+    purple = ExecuteProcess(
+        cmd=[
+            "ros2", "run", "gazebo_ros", "spawn_entity.py",
+            "-file",
+            os.path.join(pkg, "models", "purple_cube.sdf"),
+            "-entity", "purple_cube",
+            "-x", "-0.39",
+            "-y", "0.10",
+            "-z", "0.02",
+        ],
+        output="screen",
+    )
+
+    extras = TimerAction(
+        period=5.0,
+        actions=[
+            green,
+            purple,
+        ],
+    )
+
+    return LaunchDescription([
+        DeclareLaunchArgument(
+            "scenario",
+            default_value="blocked",
+        ),
+        core,
+        extras,
+    ])
